@@ -1,0 +1,7 @@
+{
+  "name": "dagger-dotnet-toolchain",
+  "engineVersion": "v0.20.3",
+  "sdk": {
+    "source": "typescript"
+  }
+}
