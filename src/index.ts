@@ -13,7 +13,7 @@
  * rest is a long description with more detail on the module's purpose or usage,
  * if appropriate. All modules should have a short description.
  */
-import { dag, Container, Directory, object, func } from "@dagger.io/dagger"
+import { dag, Container, argument, Directory, object, func } from "@dagger.io/dagger"
 
 @object()
 export class DaggerDotnetToolchain {
@@ -40,8 +40,8 @@ export class DaggerDotnetToolchain {
   }
 
   @func({ cache: "session" })
-  async calVer(gitDirectory: Directory, buildNumber: number): Promise<string> {
-    const head = gitDirectory.asGit().head()
+  async calVer(@argument({ defaultPath: "/" }) root: Directory, buildNumber: number = 0): Promise<string> {
+    const head = root.asGit().head()
     const sha = await head.commit()
     if (!/^[0-9a-f]{40}$/i.test(sha)) {
       throw new Error(`Expected git SHA, got: ${sha}`)
