@@ -42,7 +42,7 @@ export class DaggerDotnetToolchain {
   @func({ cache: "session" })
   async calVer(gitDirectory: Directory, buildNumber: number): Promise<string> {
     const g = gitDirectory.asGit();  
-    const sha = await g.head().id();
+    const sha = await g.head().commit();
     const now = new Date()
     const year = String(now.getUTCFullYear()).padStart(4, "0")
     const month = String(now.getUTCMonth() + 1).padStart(2, "0")
