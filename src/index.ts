@@ -46,13 +46,19 @@ export class DaggerDotnetToolchain {
     if (!/^[0-9a-f]{40}$/i.test(sha)) {
       throw new Error(`Expected git SHA, got: ${sha}`)
     }
+    const branchRef = await head.ref()     // e.g. "refs/heads/main"
+    const branchName = branchRef.replace(/^refs\/heads\//, "")
+    const safeBranchName = branchName.replace(/[^a-zA-Z0-9._-]/g, "")
+    const shortSafeBranchName = safeBranchName.length > 20 ? 
+      safeBranchName.slice(0, 20) : 
+      safeBranchName
     const now = new Date()
     const year = String(now.getUTCFullYear()).padStart(4, "0")
     const month = String(now.getUTCMonth() + 1).padStart(2, "0")
     const day = String(now.getUTCDate() + 1).padStart(2, "0")
     const shortSha = sha.slice(0, 10)
     const calVer = `${year}.${month}.${day}`
-    const version = `${calVer}+sha.${shortSha}`
+    const version = `${calVer}+sha.${shortSha}.build.${buildNumber}.branch.${shortSafeBranchName}`
     return version;
   }
 }
