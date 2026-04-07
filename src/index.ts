@@ -58,7 +58,7 @@ export class DaggerDotnetToolchain {
     const day = String(now.getUTCDate() + 1).padStart(2, "0")
     const shortSha = sha.slice(0, 10)
     const calVer = `${year}.${month}.${day}`
-    const version = `${calVer}+sha.${shortSha}.build.${buildNumber}.branch.${shortSafeBranchName}`
+    const version = `${calVer}+branch.${shortSafeBranchName}.build.${buildNumber}.sha.${shortSha}`
     return version;
   }
 }
