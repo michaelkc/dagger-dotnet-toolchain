@@ -16,7 +16,7 @@
 import { dag, Container, argument, Directory, object, func, Secret, CacheVolume } from "@dagger.io/dagger"
 
 const GITHUB_NUGET_SOURCE_SEGES = "https://nuget.pkg.github.com/segesdk/index.json"
-const DOTNET_IMAGE = "mcr.microsoft.com/dotnet/sdk:10.0"
+const DOTNET_IMAGE = "mcr.microsoft.com/dotnet/sdk:8.0"
 const PUBLIC_NUGET_SOURCE = "https://api.nuget.org/v3/index.json"
 
 @object()
