@@ -13,11 +13,14 @@
  * rest is a long description with more detail on the module's purpose or usage,
  * if appropriate. All modules should have a short description.
  */
-import { dag, Container, argument, Directory, object, func, Secret, CacheVolume } from "@dagger.io/dagger"
+import { dag, Container, argument, Directory, File, object, func, Secret, CacheVolume } from "@dagger.io/dagger"
 
-const GITHUB_NUGET_SOURCE_SEGES = "https://nuget.pkg.github.com/segesdk/index.json"
+const NUGET_SOURCE_GITHUB_SEGES = "https://nuget.pkg.github.com/segesdk/index.json"
+const NUGET_SOURCE_PUBLIC = "https://api.nuget.org/v3/index.json"
+const NUGET_SOURCE_DEFAULT_USER = "github"
 const DOTNET_IMAGE = "mcr.microsoft.com/dotnet/sdk:8.0"
-const PUBLIC_NUGET_SOURCE = "https://api.nuget.org/v3/index.json"
+const SRC_FOLDER = "src"
+const ARTIFACTS_FOLDER = "/artifacts"
 
 @object()
 export class DaggerDotnetToolchain {
@@ -70,34 +73,178 @@ export class DaggerDotnetToolchain {
   }
 
   @func({ cache: "session" })
-  dotnetRestore(
+  async dotnetRestore(
     @argument({ defaultPath: "/" }) root: Directory,
-    solution: string = "src/sampleapp.sln",
     githubFeedToken?: Secret,
-    githubUsername: string = "github",
-    githubFeedUrl: string = GITHUB_NUGET_SOURCE_SEGES,
-  ): Container {
+    githubUsername: string = NUGET_SOURCE_DEFAULT_USER,
+    githubFeedUrl: string = NUGET_SOURCE_GITHUB_SEGES,
+  ): Promise<Container> {
     let pipeline = this.dotnetContainer(root)
-    // TODO: Find slns in path
+    const solutions = await this.findSolutionFiles(root)
+    const sources = [NUGET_SOURCE_PUBLIC]
+    let addRemoveCommands = ""
+
+    let githubSourceWasAdded = false
     if (githubFeedToken) {
-      pipeline = pipeline
-        .withSecretVariable("GITHUB_FEED_TOKEN", githubFeedToken)
-        .withExec([
-          "sh",
-          "-lc",
-          [
-            "set -eu",
-            `dotnet nuget add source "${githubFeedUrl}" --name dagger-github-temp --username "${githubUsername}" --password "$GITHUB_FEED_TOKEN" --store-password-in-clear-text`,
-            `dotnet restore "${solution}" --source "${PUBLIC_NUGET_SOURCE}" --source "${githubFeedUrl}"`,
-            "dotnet nuget remove source dagger-github-temp",
-          ].join("\n"),
-        ])
-    } else {
-      console.warn("Currently no-op.")
+      const tokenValue = await githubFeedToken.plaintext()
+      if (tokenValue.length < 8) {
+        throw new Error(`githubFeedToken is too short (${tokenValue.length} chars), must be at least 8 characters`)
+      }
+      console.log(`Restoring with GitHub PAT: ${tokenValue.slice(0, 8)}... (${tokenValue.length} chars)`)
+      sources.push(githubFeedUrl)
+      pipeline = pipeline.withSecretVariable("GITHUB_FEED_TOKEN", githubFeedToken)
+      addRemoveCommands = [
+        `if dotnet nuget list source --format short | grep -q "^github "; then`,
+        `  echo "GitHub nuget source already registered, skipping add/remove"`,
+        `else`,
+        `  dotnet nuget add source "${githubFeedUrl}" --name github --username "${githubUsername}" --password $GITHUB_FEED_TOKEN --store-password-in-clear-text && touch /tmp/github_source_added`,
+        `fi`,
+      ].join("\n")
     }
+
+    const restoreCommands = solutions
+      .map(sln => {
+        const sourceFlags = sources.map(s => `--source "${s}"`).join(" ")
+        return `dotnet restore "${sln}" --use-lock-file ${sourceFlags}`
+      })
+      .join(" && ")
+
+    const removeCommand = githubFeedToken ? "if [ -f /tmp/github_source_added ]; then dotnet nuget remove source github && rm /tmp/github_source_added; fi" : ""
+
+    const commands = ["set -eu"]
+    if (addRemoveCommands) commands.push(addRemoveCommands)
+    if (restoreCommands) commands.push(restoreCommands)
+    if (removeCommand) commands.push(removeCommand)
+
+    pipeline = pipeline.withExec([
+      "sh",
+      "-lc",
+      commands.join(" && "),
+    ])
+
     return pipeline;
   }
 
+  @func({ cache: "session" })
+  async dotnetBuild(
+    @argument({ defaultPath: "/" }) root: Directory,
+    githubFeedToken?: Secret,
+    githubUsername: string = NUGET_SOURCE_DEFAULT_USER,
+    githubFeedUrl: string = NUGET_SOURCE_GITHUB_SEGES,
+  ): Promise<Container> {
+    const restoredContainer = await this.dotnetRestore(root, githubFeedToken, githubUsername, githubFeedUrl)
+    const solutions = await this.findSolutionFiles(root)
+    const buildCommands = solutions
+      .map(sln => `dotnet build "${sln}" --no-restore -c Release`)
+      .join(" && ")
+
+    const pipeline = restoredContainer.withExec([
+      "sh",
+      "-lc",
+      `set -eu && ${buildCommands}`,
+    ])
+
+    return pipeline;
+  }
+
+  @func({ cache: "session" })
+  async dotnetPublish(
+    @argument({ defaultPath: "/" }) root: Directory,
+    publishConfig: File,
+    githubFeedToken?: Secret,
+    githubUsername: string = NUGET_SOURCE_DEFAULT_USER,
+    githubFeedUrl: string = NUGET_SOURCE_GITHUB_SEGES,
+  ): Promise<Directory> {
+    type PublishEntry = { PackageName: string; ProjectFile: string }
+    let entries: PublishEntry[]
+    try {
+      const content = await publishConfig.contents()
+      entries = JSON.parse(content)
+      if (!Array.isArray(entries)) {
+        throw new Error("JSON must be an array")
+      }
+    } catch (e) {
+      throw new Error(`Failed to parse publish config JSON: ${e instanceof Error ? e.message : String(e)}`)
+    }
+
+    const restoredContainer = await this.dotnetRestore(root, githubFeedToken, githubUsername, githubFeedUrl)
+    const allCsprojFiles = await this.findCsprojRecursive(root.directory(SRC_FOLDER), SRC_FOLDER)
+
+    const publishCommands: string[] = []
+    for (const entry of entries) {
+      const projectPath = allCsprojFiles.find(f => f.endsWith(`/${entry.ProjectFile}`) || f.endsWith(entry.ProjectFile))
+      if (!projectPath) {
+        throw new Error(`Project file "${entry.ProjectFile}" not found in ${SRC_FOLDER}. Available: ${allCsprojFiles.join(", ")}`)
+      }
+      const outputPath = `${ARTIFACTS_FOLDER}/${entry.PackageName}`
+      publishCommands.push(`dotnet publish "${projectPath}" --no-restore -c Release --output "${outputPath}"`)
+    }
+
+    const pipeline = restoredContainer.withExec([
+      "sh",
+      "-lc",
+      `set -eu && ${publishCommands.join(" && ")}`,
+    ])
+
+    return pipeline.directory(ARTIFACTS_FOLDER);
+  }
+
+  @func()
+  async listFiles(@argument({ defaultPath: "/" }) root: Directory): Promise<string> {
+    return this.dotnetContainer(root)
+      .withExec(["ls", "-la"])
+      .stdout()
+  }
+
+  private async findSolutionFiles(root: Directory): Promise<string[]> {
+    const srcDir = root.directory(SRC_FOLDER)
+    const entries = await srcDir.entries()
+    const slnFiles = entries.filter((f: string) => f.endsWith(".sln"))
+    const slnxFiles = entries.filter((f: string) => f.endsWith(".slnx"))
+    const allSolutions = [...slnFiles, ...slnxFiles].map((f: string) => `${SRC_FOLDER}/${f}`)
+    if (allSolutions.length === 0) {
+      console.warn(`⚠️ No .sln or .slnx files found in /${SRC_FOLDER} folder`)
+    }
+    return allSolutions
+  }
+
+  private async findProjectFiles(root: Directory, projectNames: string[]): Promise<string[]> {
+    const allCsprojFiles = await this.findCsprojRecursive(root.directory(SRC_FOLDER), SRC_FOLDER)
+    const matchedProjects: string[] = []
+
+    for (const projectName of projectNames) {
+      const matchingProject = allCsprojFiles.find(f => f.includes(projectName))
+      if (!matchingProject) {
+        throw new Error(`Project "${projectName}" not found in ${SRC_FOLDER}. Available: ${allCsprojFiles.join(", ")}`)
+      }
+      matchedProjects.push(matchingProject)
+    }
+
+    return matchedProjects
+  }
+
+  private async findCsprojRecursive(dir: Directory, basePath: string): Promise<string[]> {
+    const entries = await dir.entries()
+    const results: string[] = []
+
+    for (const entry of entries) {
+      if (entry.endsWith(".csproj")) {
+        results.push(`${basePath}/${entry}`)
+      } else if (!entry.includes(".")) {
+        try {
+          const subDir = dir.directory(entry)
+          const subResults = await this.findCsprojRecursive(subDir, `${basePath}/${entry}`)
+          results.push(...subResults)
+        } catch {
+          // Not a directory, skip
+        }
+      }
+    }
+
+    return results
+  }
+
+  @func({ cache: "60m" })  
   private dotnetContainer(@argument({ defaultPath: "/" }) root: Directory): Container {
     const nugetPackages: CacheVolume = dag.cacheVolume("dotnet-toolchain-nuget-packages")
     const nugetHttp: CacheVolume = dag.cacheVolume("dotnet-toolchain-nuget-http")
